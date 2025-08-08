@@ -38,5 +38,6 @@ func main() {
 
 	wg.Wait()
 
+	// always 1000
 	fmt.Println(counter)
 }
