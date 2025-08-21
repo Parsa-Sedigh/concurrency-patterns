@@ -138,3 +138,42 @@ Calling `Signal()` before Unlock() in the producer eliminates the gap between Un
 making the signal more reliable by ensuring it matches the state change.
 
 The only remaining gap is post-`Unlock()` to consumer wake-up(the delay when consumer actually wakes up) which the for loop handles.
+
+## 4-fan-in-fan-out 
+In Go concurrency, the fan-in pattern refers to a scenario where multiple goroutines send **results** to a single **channel**,
+effectively "funneling" their outputs into one stream of data that can be **consumed by a single receiver.**
+
+fan-out: a single source distributes work to multiple **workers**.
+
+### Choosing the Right Approach for worker pool
+- Static Division: Use when the task count is known upfront and tasks have similar durations. It guarantees equal distribution.
+- Dynamic Division: Use for dynamic tasks. Use a buffered channel to reduce contention and improve fairness.
+- Round-Robin: Use when strict equality is critical, and you’re okay with managing multiple channels. 
+- Work Stealing: Use for advanced scenarios with highly variable task durations (not shown here due to complexity).
+
+### Static division - When number of tasks are known up-front
+- Worker Assignment: Each worker goroutine receives its own slice of tasks (taskChunk) and processes them directly, 
+eliminating the need for a shared task channel.
+- Fan-In for Results: Workers send results to a **shared** resultCh channel.
+- Equal Distribution: Each worker gets an equal (or nearly equal) number of tasks. If there’s a remainder, the first few workers get one extra task.
+
+Pros:
+- Guarantees equal task distribution (or as equal as possible with remainders).
+- No contention on a task channel, as tasks are pre-assigned.
+- Simple to implement for a known task count.
+
+Cons:
+- Requires knowing the task list upfront.
+- Less flexible for dynamically generated tasks.
+
+### Note: When to Make tasksCh Buffered?
+1. High Task Volume or **Burst** of Tasks
+2. Reducing **Contention** Between Distributor and Workers: With an unbuffered channel, the distributor goroutine blocks on
+   each send (tasksCh <- task) until a worker receives the task. This can create contention if many workers are competing for 
+   tasks or if task processing times vary significantly.
+3. Improving **Fairness** in Task Distribution: With an unbuffered channel, faster workers may grab tasks more quickly, leading to uneven task distribution.
+   A buffered channel allows tasks to be queued, giving slower workers a chance to pick up tasks before the channel empties.
+   Note that in static division we don't need buffered chan because tasks are already split evenly
+   between workers
+4. **Asynchronous** Task **Generation**: If tasks are generated dynamically (e.g., from an external source like a network or stream),
+   a buffered channel can absorb bursts of incoming tasks, preventing the producer from blocking while workers catch up.
