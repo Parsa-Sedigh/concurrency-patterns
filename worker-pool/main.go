@@ -4,21 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
 )
 
-func main() {}
-
-type Task struct{}
+type Task struct {
+	name string
+}
 
 type Result struct {
 	Value int
 	Err   error
 }
 
-func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) []Result {
+func main() {
+	results, err := workerPoolWithContext(context.Background(), []Task{{name: "task 1"}, {name: "task 2"}, {name: "task 3"}}, 3)
+	if err != nil {
+		/* Without this, a cancelled run is indistinguishable from a short task list: you just get fewer
+		results back and no way to tell why.*/
+		log.Println("pool stopped early:", err)
+	}
+
+	log.Println(results)
+}
+
+func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) ([]Result, error) {
 	// 1. create channels
 	tasksCh := make(chan Task)
 	resultCh := make(chan Result)
@@ -29,45 +41,68 @@ func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) []
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 
-		go func(id int) {
-			fmt.Println(i, id)
+		go func() {
+			defer wg.Done()
 
-			select {
-			case task, ok := <-tasksCh:
-				if !ok {
-					// Channel is closed, exit worker
-					return
-				}
+			/* On which loop to use - `for task := range tasksCh` vs `for { select { ... } }` -
+			see receiving-tasks.md in this folder. Short version: with one sender that does
+			`defer close(tasksCh)`, the close already wakes every idle worker, so watching
+			ctx.Done() here as well buys nothing. Use `for range`. */
+			for task := range tasksCh {
+				/* Note: Checking for ctx.Done() inside a select{} here buys nothing. Because we're using for range chan which
+				receives cancellation from sender. The sender is watching ctx.Done() itself.*/
+				result := processTask(ctx, task)
 
-				result := processTask(task)
+				/*  Why another select{} here?
 
+				If you wanna go extreme and throw away the work that was done after ctx is done, you would want to do another
+				select{} here before sending the result into it's channel. Otherwise(which is what we want most of the time),
+				don't check ctx.Done() again here, just send the res to chan.*/
 				select {
-				// Check cancellation before sending result
 				case <-ctx.Done():
 					return
 
-				// Send result
 				case resultCh <- result:
 				}
 			}
-		}(i)
+		}()
 	}
 
 	// 3. send tasks to workers. Here, we do task distribution which is done via a channel,
 	go func() {
-		for _, task := range tasks {
-			/* Q: Why do we need to spawn a goroutine here? */
-			/* A:
-			Non-blocking task sending: Sending tasks to taskCh can block if the channel’s buffer is full or if workers are busy.
-			Without a goroutine, the main goroutine would block on taskCh <- task, halting the program until a worker receives the task.
-			A separate goroutine allows task distribution to proceed independently, keeping the main flow free to
-			handle other logic (e.g., starting workers or collecting results).
+		/* The sender has to close tasksCh on every exit path, including the cancelled one. One way is to close it before
+		returning in <- ctx.Done() case, but to be sure that it's closed when the goroutine returns, we do it inside a defer.
 
-			So Distributing tasks concurrently allows the program to scale, as the task sender doesn’t wait for
-			each task to be processed before sending the next.*/
+		This close is also what stops the workers. Closing a chan wakes every goroutine blocked receiving on it at once,
+		so cancelling ctx here reaches the idle workers without them watching ctx themselves. See receiving-tasks.md.*/
+		defer close(tasksCh)
+
+		for _, task := range tasks {
+			/* Q: Why do we need to spawn a goroutine for this sending loop? */
+			/* A: Not for speed. For correctness - inline, this deadlocks.
+
+			Say 5 tasks and 3 workers. The first 3 sends succeed. The 4th send blocks, because every worker is busy.
+			So we never reach the `for res := range resultCh` loop at the bottom of this func. The workers then finish
+			their tasks and block on `resultCh <- result` with nobody reading. Everything stops.
+
+			Sending in its own goroutine is what lets the sending and the collecting happen at the same time.
+			(It only works inline while len(tasks) <= numWorkers, which is why it looks fine in small examples.)*/
 
 			/* We can't just do: taskCh <- task because we need to simultaneously check if ctx is cancelled everytime we wanna
-			send a task to the task channel. Now to check for this, we need a select{}*/
+			send a task to the task channel.
+
+			REMEMBER: receiving and sending are not symmetric.
+
+			Always pair a SEND with select{ case <- ctx.Done() ...} . This will also make consumers to avoid having to check for
+			ctx.Done() themselves because it's being done by the sender. The consumer can do this when it's using `for range chan`
+			which works this way:
+
+			- If chan is unbuffered, it immediately wakes an idle consumer.
+			- If chan is buffered, the worker consumes all previously accumulated msgs in chan before getting to the close signal.
+
+			If you want the consumer to leave the prev accumulated work, use select{ case <- ctx.Done() } in the consumer in addition
+			to the sender. */
+
 			select {
 			// Stop sending tasks if ctx is canceled
 			case <-ctx.Done():
@@ -81,10 +116,14 @@ func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) []
 
 	// 4. collect results. Here, we do result collection which is done via a channel,
 	/* Q: Why do we need to spawn a goroutine here? */
-	/* A: A separate goroutine handles the waiting, allowing the main goroutine to focus on reading from resultCh immediately.
-	If the main goroutine called wg.Wait() directly, it couldn’t move to collecting results concurrently, as it would be stuck waiting.
-	By spawning a goroutine for this task which is another blocking task, maximizes efficiency.
-	The main goroutine can start gathering results immediately, rather than waiting for all tasks to complete before starting collection.*/
+	/* A: Same answer as the sender above - correctness, not speed. Inline, this deadlocks every time.
+
+	resultCh is unbuffered, so a worker's send blocks until someone receives. Calling wg.Wait() here directly would
+	block before the `for res := range resultCh` loop below ever started, so the workers could never finish, so Wait
+	would never return.
+
+	Running Wait in its own goroutine lets it happen at the same time as that loop. And close(resultCh) after Wait is
+	what ends the loop - without the close, the range would block forever once the last result was read.*/
 	results := make([]Result, 0, len(tasks))
 	go func() {
 		// Wait for all workers to finish
@@ -92,25 +131,38 @@ func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) []
 		close(resultCh)
 	}()
 
+	/* Results arrive in completion order, not task order. If you ever need results[i] to line up with tasks[i],
+	collect into a pre-sized slice by index instead of a channel.*/
 	for res := range resultCh {
 		results = append(results, res)
 	}
 
-	// 5. return results
-	return results
+	/* 5. return results. ctx.Err() is nil when we were not cancelled, so this one line covers both cases.
+	On the cancelled path the results are partial - the tasks that never got sent are simply missing from the slice,
+	which is why the caller needs the error to tell "cancelled" apart from "short task list".*/
+	return results, ctx.Err()
 }
 
-func processTask(task Task) Result {
-	fmt.Println("processing task ...")
+func processTask(ctx context.Context, task Task) Result {
+	fmt.Println("processing", task.name, "...")
 
-	randVal := rand.Intn(1000)
-	time.Sleep(time.Duration(randVal) * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		return Result{Value: -1, Err: fmt.Errorf("context canceled: %w", ctx.Err())}
 
-	if randVal%2 == 0 {
-		return Result{Value: randVal, Err: errors.New("some err msg")}
-	}
+	case <-time.After(time.Second):
+		randVal := rand.Intn(1000)
 
-	return Result{
-		Value: randVal,
+		if randVal%2 == 0 {
+			log.Printf("processed task %v with error \n", task.name)
+
+			return Result{Value: randVal, Err: errors.New("some err msg")}
+		}
+
+		log.Printf("processed task %v\n", task.name)
+
+		return Result{
+			Value: randVal,
+		}
 	}
 }
