@@ -38,6 +38,8 @@ func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) ([
 	var wg sync.WaitGroup
 
 	// 2. start workers(goroutines) - each task is done by one goroutine
+	// NOTE: You can't loop on tasks. Since that would spawn a goroutine for each task, but we may not be able to spawn that many goroutines.
+	// Since the tasks could be 1B!
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 
@@ -131,8 +133,12 @@ func workerPoolWithContext(ctx context.Context, tasks []Task, numWorkers int) ([
 		close(resultCh)
 	}()
 
-	/* Results arrive in completion order, not task order. If you ever need results[i] to line up with tasks[i],
-	collect into a pre-sized slice by index instead of a channel.*/
+	/*
+		The workerPoolWithContext() func is responsible for completing the tasks slice. So we need to block on the completion of tasks, hence
+		the for range resultCh.
+
+		Results arrive in completion order, not task order. If you ever need results[i] to line up with tasks[i],
+		collect into a pre-sized slice by index instead of a channel.*/
 	for res := range resultCh {
 		results = append(results, res)
 	}
