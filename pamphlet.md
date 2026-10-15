@@ -139,6 +139,36 @@ making the signal more reliable by ensuring it matches the state change.
 
 The only remaining gap is post-`Unlock()` to consumer wake-up(the delay when consumer actually wakes up) which the for loop handles.
 
+### IMPORTANT: the for loop does NOT handle that gap
+The line above is wrong, and `3-cond/main.go` proves it: that program deadlocks 35 runs out of 40.
+
+The for loop stops the consumer from acting on a **false** condition. It cannot recover a condition that was
+true and got **overwritten** while the consumer was asleep. In that file the producer set `pokemon = "Pikachu"`
+about 20 times per run and the consumer caught none of them: `Signal()` only marks the consumer runnable, the
+producer re-locks immediately, and it finishes all 100 iterations before the consumer acquires the mutex once.
+The consumer then sees some other pokemon, calls `Wait()` again, and nothing is left alive to signal it.
+
+**A signal is not a message.** Signals are not queued, not counted and not buffered. The waiter reads whatever
+the state holds when it finally gets the lock. So the thing you wait on must be **durable state** that stays
+true until a waiter consumes it:
+
+```go
+if pokemon == "Pikachu" {
+    sawPikachu = true // sticky, so waking late is fine
+}
+...
+for !sawPikachu {     // instead of: for pokemon != "Pikachu"
+    cond.Wait()
+}
+```
+
+Three rules, not two:
+1. Both sides hold the same lock.
+2. `for`, never `if`.
+3. The condition must be durable state, not a value someone keeps overwriting.
+
+Rules 1 and 2 were already correct in that file. Rule 3 is what it broke. Full write-up in `3-cond/README.md`.
+
 ## 4-fan-in-fan-out 
 In Go concurrency, the fan-in pattern refers to a scenario where multiple goroutines send **results** to a single **channel**,
 effectively "funneling" their outputs into one stream of data that can be **consumed by a single receiver.**
@@ -166,6 +196,17 @@ Cons:
 - Requires knowing the task list upfront.
 - Less flexible for dynamically generated tasks.
 
+### Use a task channel when
+1. You don't have all the tasks up front. Tasks arrive from a scanner, a network connection, a database cursor, another stage of
+a pipeline. You cannot split a slice you haven't finished building. This is the strongest reason, and often the only one you need.
+2. Tasks take very different amounts of time. A channel balances load by itself: whichever worker finishes first takes the next task. 
+Split a slice into fixed chunks instead and one worker can get all the slow items while the others sit idle.
+3. You want the producer to slow down. An unbuffered or small-buffered channel blocks the sender when every worker is busy.
+4. Several producers feed one pool, or the pool outlives one batch — a long-running server where handlers push work in.
+
+### Dont use task chan when
+When you already have the full slice and the tasks are cheap or uniform. Split it:
+
 ### Note: When to Make tasksCh Buffered?
 1. High Task Volume or **Burst** of Tasks
 2. Reducing **Contention** Between Distributor and Workers: With an unbuffered channel, the distributor goroutine blocks on
@@ -177,3 +218,74 @@ Cons:
    between workers
 4. **Asynchronous** Task **Generation**: If tasks are generated dynamically (e.g., from an external source like a network or stream),
    a buffered channel can absorb bursts of incoming tasks, preventing the producer from blocking while workers catch up.
+
+## 5-Mutex vs WaitGroup vs Channel vs Cond
+These four are not alternatives to each other. Each answers a different question, and most real code uses
+several at once. Pick by the question you are actually asking.
+
+| tool | the question it answers | use it when |
+| --- | --- | --- |
+| `sync.Mutex` | "May I touch this state right now?" | Two or more goroutines read and write the same variable, and you want them to take turns. |
+| `sync.WaitGroup` | "Have they all finished?" | You started N goroutines and must not continue until every one is done. |
+| `chan T` | "Who wants this value?" | You are moving data between goroutines, or releasing waiters once with `close`. |
+| `sync.Cond` | "Wake me when this might be true." | You are waiting on a predicate over state a mutex already guards, and the predicate becomes true again and again. |
+
+### Mutex - protect state
+Guards a **critical section**: the lines that read or write shared memory. It says nothing about order or
+timing, only that one goroutine is inside at a time. If you find yourself sleeping in a loop to wait for a value
+to change while holding a mutex, you want a Cond (or a channel), not a mutex.
+
+Cannot: wait for anything, carry values, or be cancelled.
+
+### WaitGroup - wait for a known count
+`Add` before you start the goroutine, `Done` inside it (use `defer`), `Wait` somewhere else. The count must be
+known - that is the whole limitation. `Add` inside the goroutine is a bug, because `Wait` can see zero and
+return before the goroutine has even started.
+
+A WaitGroup tells you goroutines have **finished**. It says nothing about what they produced, and nothing about
+the order they finished in.
+
+Cannot: be cancelled, return values, or handle an unknown number of goroutines added over time.
+
+### Channel - move values, and release waiters once
+Does four separate jobs, which is why it is the default answer in Go:
+1. Hand a value to whichever goroutine is ready: `ch <- v`.
+2. Release **any number** of waiters, one time only: `close(ch)`. The signaller never has to know how many
+   there are, and goroutines arriving after the close are released too.
+3. Act as a bounded queue: `make(chan T, n)`.
+4. Be waited on **with a timeout or cancellation**, via `select` with `ctx.Done()`. Nothing else here can do this.
+
+Cannot: repeat a broadcast. A channel closes once. Conditions that flip true, false, true need a Cond or a
+fresh channel per round.
+
+### Cond - wait for a repeatable condition on locked state
+Always used **together with** a mutex, never instead of one. Worth it only when all three hold:
+1. The state is already behind a mutex.
+2. The condition becomes true more than once.
+3. Waiters must re-check on waking, because they compete for the state.
+
+Cannot: be cancelled, deliver values, or preserve a signal for a waiter that has not arrived yet.
+
+### Deciding in one pass
+- Only protecting shared state? **Mutex**.
+- Only waiting for N goroutines to end? **WaitGroup**.
+- Moving values between goroutines? **Channel**.
+- One-time "go ahead" to an unknown number of goroutines? **`close(ch)`**, not Cond.
+- Need a timeout or ctx cancellation while waiting? **Channel** - Cond cannot be interrupted at all.
+- Waiting on a condition over mutex-guarded state that keeps flipping? **Cond**.
+
+### How they combine
+- **Mutex + Cond**: always together. `sync.NewCond(&mu)` takes the mutex that already guards the state.
+- **WaitGroup + Channel**: the standard "close the results channel" pattern - one goroutine does
+  `wg.Wait(); close(resultCh)` while the main goroutine ranges over `resultCh`. `wg.Wait()` must be in its own
+  goroutine or it deadlocks, because the workers cannot finish until someone reads the channel. See
+  `worker-pool/main.go` and `merge()` in `fan-in-fan-out/main.go`.
+- **Mutex + WaitGroup**: workers append results under a mutex, `Wait` tells the caller when it is safe to read
+  the slice without the lock.
+- **Channel + ctx**: pair every **send** with `case <-ctx.Done()`. Receives usually do not need it, because the
+  upstream `close` already ends a `for range`. See `worker-pool/receiving-tasks.md`.
+
+### Two mistakes that show up in interviews
+- Using a **Mutex plus a sleep loop** to wait for a value to change. That is a Cond or a channel.
+- Using a **Cond for a one-shot event** with an unknown number of waiters. That is `close(ch)`, which is shorter
+  and can be cancelled.
